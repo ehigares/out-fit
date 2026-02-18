@@ -2,7 +2,7 @@
 
 Bay Area outdoor fitness events and clubs — Flutter + Supabase MVP.
 
-> Sprint 1 scaffold: auth, profile onboarding, clubs, events, home feed, RSVP (private), reviews, and admin approval workflow.
+> **Active branch:** `mvp-sprint-1` — Sprint 1 scaffold + RLS hardening patch.
 
 ---
 
@@ -30,7 +30,7 @@ Bay Area outdoor fitness events and clubs — Flutter + Supabase MVP.
 ```bash
 git clone https://github.com/ehigares/out-fit.git
 cd out-fit
-git checkout claude/scaffold-flutter-supabase-mvp-kAl8F
+git checkout mvp-sprint-1        # ← primary working branch (Sprint 1 + hardening)
 
 # Generate Flutter platform files (Android + iOS stubs)
 flutter create . --project-name out_fit --org com.outfit
@@ -38,6 +38,10 @@ flutter create . --project-name out_fit --org com.outfit
 # Install Dart dependencies
 flutter pub get
 ```
+
+> **Branch history:**
+> `claude/scaffold-flutter-supabase-mvp-kAl8F` is the original scaffold branch
+> (preserved as provenance). All active development is on `mvp-sprint-1`.
 
 ### 3. Configure environment
 
@@ -55,13 +59,14 @@ SUPABASE_ANON_KEY=your-anon-public-key
 
 ### 4. Apply Supabase schema
 
-Go to your Supabase project → **SQL Editor** → paste and run:
+Go to your Supabase project → **SQL Editor** → run each file **in order**:
 
 ```
-supabase/migrations/001_initial_schema.sql
+supabase/migrations/001_initial_schema.sql   # tables, indexes, base RLS
+supabase/migrations/002_rls_events_update_hardening.sql  # Sprint 1 hardening patch
 ```
 
-Or use the Supabase CLI:
+Or use the Supabase CLI (runs all migrations in order):
 
 ```bash
 supabase db push
@@ -209,6 +214,80 @@ USING (
   OR ...admin...               -- admin sees all
 )
 ```
+
+---
+
+## Sprint 1 Hardening — RLS Self-Approval Fix
+
+Migration `002_rls_events_update_hardening.sql` replaces the single combined
+UPDATE policy (which had no `WITH CHECK`) with three narrowly-scoped policies.
+
+### What the vulnerability was
+
+The original policy:
+```sql
+-- ❌ VULNERABLE — no WITH CHECK
+CREATE POLICY "events: creator edit draft or pending"
+  ON public.events FOR UPDATE
+  USING (
+    (auth.uid() = creator_id AND status IN ('draft', 'pending'))
+    OR (auth.uid() = creator_id AND status = 'approved')
+    OR EXISTS (admin check)
+  );
+```
+`USING` only gates *which rows* the caller can touch. Without `WITH CHECK`,
+it placed no restriction on *what values* the caller could write. A creator
+could run:
+```sql
+UPDATE events SET status = 'approved', approved_by = auth.uid() WHERE id = '<their pending event>';
+```
+This bypassed the admin-only approval requirement.
+
+### The fix — three separate policies
+
+| Policy | USING (OLD row gate) | WITH CHECK (NEW row gate) |
+|---|---|---|
+| **Admin update any** | `is_admin = TRUE` | `is_admin = TRUE` |
+| **Creator edit draft/pending** | `creator_id = uid AND status IN ('draft','pending')` | `status IN ('draft','pending') AND approved_by IS NULL AND approved_at IS NULL` |
+| **Creator cancel approved** | `creator_id = uid AND status = 'approved'` | `status = 'cancelled' AND approved_by IS NOT NULL AND approved_at IS NOT NULL` |
+
+### Verification test plan
+
+**Setup:** two Supabase users — User A (non-admin) and Admin.
+
+| Step | Actor | Action | Expected result |
+|---|---|---|---|
+| 1 | User A | Create event | Status = `pending` (set by DB trigger) |
+| 2 | User A | `UPDATE events SET status='approved' WHERE id=...` | **Blocked** — Policy B `WITH CHECK`: `status` must stay in `('draft','pending')` |
+| 3 | User A | `UPDATE events SET approved_by='<admin-uuid>' WHERE id=...` | **Blocked** — Policy B `WITH CHECK`: `approved_by IS NULL` violated |
+| 4 | Admin | `UPDATE events SET status='approved', approved_by=uid, approved_at=now() WHERE id=...` | **Succeeds** — Policy A allows admins unrestricted updates |
+| 5 | User A | `UPDATE events SET status='cancelled' WHERE id=...` (event now approved) | **Succeeds** — Policy C allows `status='cancelled'` for own approved events |
+| 6 | User A | `UPDATE events SET status='approved' WHERE id=...` (re-approve attempt) | **Blocked** — Policy C `WITH CHECK`: `status` must be `'cancelled'` |
+| 7 | User A | `UPDATE events SET approved_by=NULL WHERE id=...` (tamper) | **Blocked** — Policy C `WITH CHECK`: `approved_by IS NOT NULL` violated |
+
+**Quick SQL smoke test** (run in Supabase SQL Editor logged in as each user):
+```sql
+-- As User A (should fail with: new row violates row-level security policy)
+UPDATE events SET status = 'approved' WHERE id = '<your-pending-event-id>';
+
+-- As Admin (should succeed: UPDATE 1)
+UPDATE events
+SET status = 'approved',
+    approved_by = auth.uid(),
+    approved_at = now()
+WHERE id = '<your-pending-event-id>';
+
+-- As User A on now-approved event (should succeed: UPDATE 1)
+UPDATE events SET status = 'cancelled' WHERE id = '<your-approved-event-id>';
+```
+
+### Why this is complete protection
+
+Postgres evaluates `WITH CHECK` **after** `USING`. Even if a creator's row
+matches the `USING` condition, the `WITH CHECK` on the resulting row must
+also pass. Since no non-admin policy has a `WITH CHECK` that allows
+`status = 'approved'`, self-approval is impossible regardless of how the
+HTTP request is constructed — including direct PostgREST API calls.
 
 ---
 
