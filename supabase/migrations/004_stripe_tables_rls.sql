@@ -36,7 +36,7 @@ END $$;
 -- the Stripe webhook arrives.
 -- -----------------------------------------------------------
 CREATE TABLE IF NOT EXISTS public.event_purchase_intents (
-  id                        UUID        PRIMARY KEY DEFAULT uuid_generate_v4(),
+  id                        UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
   event_id                  UUID        NOT NULL REFERENCES public.events(id)   ON DELETE CASCADE,
   user_id                   UUID        NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
   -- Populated after the Stripe PaymentIntent is created (step 2 of create_payment_intent):
@@ -86,7 +86,7 @@ CREATE INDEX idx_purchase_intents_hold_expires
 -- constraint on stripe_event_id prevents double-processing.
 -- -----------------------------------------------------------
 CREATE TABLE IF NOT EXISTS public.stripe_webhook_events (
-  id                  UUID        PRIMARY KEY DEFAULT uuid_generate_v4(),
+  id                  UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
   stripe_event_id     TEXT        NOT NULL UNIQUE,
   event_type          TEXT        NOT NULL,
   purchase_intent_id  UUID        REFERENCES public.event_purchase_intents(id) ON DELETE SET NULL,
