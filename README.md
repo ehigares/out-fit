@@ -2,7 +2,7 @@
 
 Bay Area outdoor fitness events and clubs — Flutter + Supabase MVP.
 
-> **Active branch:** `mvp-sprint-1` — Sprint 1 scaffold + RLS hardening patch.
+> **Active branch:** `claude/stripe-payment-integration-I1w1K` — Sprint 2: Stripe payment integration (backend-first).
 
 ---
 
@@ -129,7 +129,7 @@ lib/
 | Trusted host auto-publish | ✅ — DB trigger sets status=approved on insert |
 | RSVP list private | ✅ — RLS + UI guard |
 | Recommended feed | ✅ — deterministic preference filter (no ML) |
-| Stripe payments | ⏳ — price field exists, UI placeholder shown |
+| Stripe payments | ✅ — Sprint 2: DB tables, RLS, edge functions, webhook idempotency |
 | Pickup sports | ❌ — excluded per MVP spec (extensibility point in DB comment) |
 | Social photo uploads | ❌ — excluded per MVP spec |
 | Chat / DMs / Maps | ❌ — excluded per MVP spec |
@@ -291,12 +291,195 @@ HTTP request is constructed — including direct PostgREST API calls.
 
 ---
 
-## Payment Integration (deferred)
+## Sprint 2 — Stripe Payment Integration
 
-- `price_cents INT DEFAULT 0` column is present on `events`
-- `currency TEXT DEFAULT 'USD'` column is present
-- The UI shows a "Payment coming soon" placeholder for paid events
-- To complete: integrate `stripe_flutter`, add `payment_intents` table, implement Stripe webhook in a Supabase Edge Function
+### Migration plan
+
+| File | What it does |
+|---|---|
+| `001_initial_schema.sql` | Base tables, indexes, RLS (Sprint 1) |
+| `002_rls_events_update_hardening.sql` | Self-approval exploit fix (Sprint 1 patch) |
+| `003_stripe_tables_rls.sql` | `purchase_status` enum, `event_purchase_intents`, `stripe_webhook_events`, RLS for both tables, patches `event_rsvps` INSERT policy to block paid-event RSVPs from clients |
+| `004_stripe_db_functions.sql` | `get_seats_used()`, `reserve_seat_if_available()`, `confirm_paid_rsvp()`, `release_purchase_hold()` — all SECURITY DEFINER; pg_cron schedule for expired hold cleanup |
+
+### Edge functions
+
+| Function | Auth | Purpose |
+|---|---|---|
+| `create_payment_intent` | JWT required | Validates event + capacity, creates hold, creates Stripe PI, returns `client_secret` |
+| `stripe_webhook` | No JWT (Stripe HMAC) | Idempotently processes Stripe events → RSVP confirm or hold release |
+
+### How paid RSVPs are created (only valid path)
+
+```
+Flutter                  Edge Functions            DB / Stripe
+  │                           │                       │
+  │── POST /create_payment_intent ──────────────────> │
+  │                           │  reserve_seat_if_available() ─> hold row inserted
+  │                           │  stripe.paymentIntents.create() ─> PI created
+  │<─ { client_secret } ──────│
+  │
+  │── Stripe SDK .confirmPayment(client_secret) ────────────────> Stripe
+  │                                                               │
+  │             Stripe ──── POST /stripe_webhook ─────────────>  │
+  │                           │  verify HMAC signature
+  │                           │  idempotency check
+  │                           │  confirm_paid_rsvp() ──> event_rsvps row inserted
+  │                           │  mark webhook processed
+  │                           │<── 200 OK ──────────────────────
+```
+
+Direct REST call to `POST /rest/v1/event_rsvps` for a paid event returns **HTTP 403** — the RLS policy `"rsvps: authenticated insert own (free events only)"` blocks it at the Postgres level.
+
+### Stripe configuration
+
+**Environment secrets** (set in Supabase Dashboard → Edge Functions → Secrets):
+
+| Secret | Where to get it |
+|---|---|
+| `STRIPE_SECRET_KEY` | Stripe Dashboard → Developers → API Keys → Secret key |
+| `STRIPE_WEBHOOK_SECRET` | Stripe Dashboard → Developers → Webhooks → (your endpoint) → Signing secret |
+
+**Webhook endpoint to register in Stripe Dashboard:**
+
+```
+https://<project-ref>.supabase.co/functions/v1/stripe_webhook
+```
+
+**Stripe events to subscribe to:**
+
+- `payment_intent.succeeded`
+- `payment_intent.payment_failed`
+- `payment_intent.canceled`
+- `charge.refunded`
+
+**Local testing with Stripe CLI:**
+
+```bash
+# Forward Stripe events to your local Supabase (or ngrok tunnel)
+stripe listen --forward-to https://<project-ref>.supabase.co/functions/v1/stripe_webhook
+
+# The CLI prints: "Your webhook signing secret is whsec_…"
+# Set that as STRIPE_WEBHOOK_SECRET in your local .env
+```
+
+**pg_cron for expired hold cleanup:**
+
+1. Enable pg_cron in Supabase Dashboard → Database → Extensions → pg_cron
+2. Uncomment the `SELECT cron.schedule(...)` block at the bottom of `004_stripe_db_functions.sql` and re-run it
+
+---
+
+## Sprint 2 — Test Plan
+
+### DB-level tests (run in Supabase SQL Editor)
+
+**Test 1: Client cannot RSVP to a paid event directly**
+
+```sql
+-- As any authenticated user via anon key (replace UUIDs)
+INSERT INTO event_rsvps (event_id, user_id, status)
+VALUES ('<paid-event-id>', auth.uid(), 'going');
+-- Expected: ERROR 42501 new row violates row-level security policy
+```
+
+**Test 2: Free event RSVPs still work**
+
+```sql
+INSERT INTO event_rsvps (event_id, user_id, status)
+VALUES ('<free-event-id>', auth.uid(), 'going');
+-- Expected: INSERT 1
+```
+
+**Test 3: Capacity is enforced atomically**
+
+```sql
+-- Simulate a full event (max_occupancy = 1, one active hold exists)
+-- Call reserve_seat_if_available for a second user:
+SELECT * FROM reserve_seat_if_available(
+  '<event-id>',
+  '<user-id-2>',
+  1000,   -- amount_cents
+  'USD',
+  15
+);
+-- Expected: { success: false, error_code: 'at_capacity' }
+```
+
+**Test 4: Confirm paid RSVP (webhook success path)**
+
+```sql
+-- As service role / SQL Editor:
+SELECT confirm_paid_rsvp('<purchase-intent-id>');
+-- Expected: 'confirmed'
+
+-- Verify RSVP exists:
+SELECT * FROM event_rsvps WHERE event_id = '<event-id>';
+-- Expected: row with status = 'going'
+
+-- Idempotency: call again
+SELECT confirm_paid_rsvp('<purchase-intent-id>');
+-- Expected: 'already_confirmed' (no error, no duplicate RSVP)
+```
+
+**Test 5: Payment failure releases hold**
+
+```sql
+SELECT release_purchase_hold('<purchase-intent-id>', 'failed');
+-- Expected: 'released'
+
+-- Verify purchase status:
+SELECT status FROM event_purchase_intents WHERE id = '<purchase-intent-id>';
+-- Expected: 'failed'
+
+-- Verify capacity is freed (seats_used decreased):
+SELECT get_seats_used('<event-id>');
+```
+
+**Test 6: Refund cancels RSVP**
+
+```sql
+-- First confirm the RSVP:
+SELECT confirm_paid_rsvp('<purchase-intent-id>');
+-- Now refund:
+SELECT release_purchase_hold('<purchase-intent-id>', 'refunded');
+-- Expected: 'released'
+
+-- Verify RSVP is now cancelled:
+SELECT status FROM event_rsvps WHERE event_id = '<event-id>' AND user_id = '<user-id>';
+-- Expected: 'cancelled'
+```
+
+### Webhook simulation (Stripe CLI)
+
+```bash
+# Test payment_intent.succeeded
+stripe trigger payment_intent.succeeded \
+  --add payment_intent:metadata.purchase_intent_id=<uuid>
+
+# Test payment_intent.payment_failed
+stripe trigger payment_intent.payment_failed \
+  --add payment_intent:metadata.purchase_intent_id=<uuid>
+
+# Verify after each trigger:
+# SELECT * FROM event_purchase_intents WHERE id = '<uuid>';
+# SELECT * FROM stripe_webhook_events ORDER BY created_at DESC LIMIT 5;
+```
+
+### Concurrent oversubscription test
+
+Simulate two concurrent `reserve_seat_if_available` calls for an event with `max_occupancy = 1`:
+
+```sql
+-- In two separate transactions opened simultaneously:
+-- Tx1: BEGIN; SELECT * FROM reserve_seat_if_available('<event-id>', '<user-1>', 1000, 'USD', 15);
+-- Tx2: BEGIN; SELECT * FROM reserve_seat_if_available('<event-id>', '<user-2>', 1000, 'USD', 15);
+-- One succeeds with success=true, the other returns error_code='at_capacity' or 'duplicate_purchase'.
+-- Both commit.
+-- Expected: exactly ONE event_purchase_intents row with status='pending_payment'.
+```
+
+---
 
 ---
 
@@ -315,5 +498,7 @@ HTTP request is constructed — including direct PostgREST API calls.
 |---|---|
 | `SUPABASE_URL` | Your Supabase project URL |
 | `SUPABASE_ANON_KEY` | Public anon key (safe to use in client) |
+| `STRIPE_SECRET_KEY` | Stripe secret key — server-side only, never in Flutter |
+| `STRIPE_WEBHOOK_SECRET` | Stripe webhook signing secret — used by stripe_webhook edge function |
 
-> The service role key is **never** used in the Flutter client. If you need server-side operations, use Supabase Edge Functions.
+> The service role key and Stripe secret key are **never** used in the Flutter client. They are injected as Supabase Edge Function secrets at deploy time.

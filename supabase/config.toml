@@ -1,0 +1,21 @@
+# =============================================================
+# Supabase project configuration
+# =============================================================
+# Full reference: https://supabase.com/docs/guides/cli/config
+
+[project]
+# Set this to your Supabase project ID (find it in project settings)
+# project_id = "your-project-id"
+
+# -----------------------------------------------------------
+# Edge Function settings
+# -----------------------------------------------------------
+
+# create_payment_intent — requires a valid user JWT
+[functions.create_payment_intent]
+verify_jwt = true
+
+# stripe_webhook — called by Stripe (no user JWT); signature verified
+# inside the function using STRIPE_WEBHOOK_SECRET.
+[functions.stripe_webhook]
+verify_jwt = false
